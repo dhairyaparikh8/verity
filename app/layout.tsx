@@ -3,9 +3,9 @@ import type { Metadata, Viewport } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Credibility Analyzer — Verify News Against Multiple Sources',
+  title: 'Credibility Analyzer — Verify Claims with Evidence',
   description:
-    'Cross-check a news URL or claim against multiple independent news outlets. Transparent, source-backed analysis with citations, confidence, and honest uncertainty.',
+    'Cross-check a news URL or claim against independent news outlets using transparent keyword-coverage matching. Free, source-backed analysis with citations and confidence levels.',
   generator: 'v0.app',
   icons: {
     icon: [

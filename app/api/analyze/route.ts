@@ -1,49 +1,67 @@
-import { generateText, generateObject } from 'ai'
-import { z } from 'zod'
-
 export const runtime = 'nodejs'
-export const maxDuration = 60
+export const maxDuration = 30
 
 type Verdict = 'verified' | 'mixed' | 'unsupported' | 'insufficient'
 
-const analysisSchema = z.object({
-  verdict: z
-    .enum(['verified', 'mixed', 'unsupported', 'insufficient'])
-    .describe(
-      'verified = multiple independent reputable outlets corroborate the claim; ' +
-        'mixed = outlets report conflicting or partial details; ' +
-        'unsupported = reputable outlets contradict or debunk the claim; ' +
-        'insufficient = not enough independent reporting was found to judge.',
-    ),
-  confidence: z
-    .number()
-    .min(0)
-    .max(1)
-    .describe('How confident the verdict is, based ONLY on gathered evidence.'),
-  confidenceReason: z
-    .string()
-    .describe('One sentence explaining what drove the confidence level.'),
-  summary: z
-    .string()
-    .describe('A neutral 2-3 sentence summary of what the reporting shows.'),
-  uncertainty: z
-    .string()
-    .describe('What remains unknown, contested, or unverifiable.'),
-  evidence: z
-    .array(
-      z.object({
-        source: z.string().describe('Name of the outlet, e.g. "Reuters".'),
-        text: z
-          .string()
-          .describe('What this outlet actually reports about the claim.'),
-        supports: z.boolean().describe('True if this source supports the claim.'),
-        contradicts: z
-          .boolean()
-          .describe('True if this source contradicts the claim.'),
-      }),
-    )
-    .describe('One entry per distinct source that was consulted.'),
-})
+type Evidence = {
+  source: string
+  text: string
+  url?: string
+  coverage: number
+  supports: boolean
+  contradicts: boolean
+  timestamp?: string
+}
+
+type Article = {
+  title: string
+  link: string
+  source: string
+  pubDate: string
+}
+
+// Common words we ignore when comparing a claim to news coverage.
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'at', 'for',
+  'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'can', 'could',
+  'should', 'may', 'might', 'must', 'that', 'this', 'these', 'those', 'it',
+  'its', 'their', 'they', 'them', 'he', 'she', 'his', 'her', 'we', 'our', 'you',
+  'your', 'i', 'my', 'me', 'not', 'no', 'so', 'up', 'out', 'about', 'into',
+  'over', 'after', 'than', 'then', 'now', 'new', 'said', 'says', 'according',
+  'report', 'reports', 'reported', 'news', 'story', 'article',
+])
+
+// Simple stemmer so "announces" matches "announced"/"announcement", etc.
+function stem(word: string): string {
+  return word
+    .replace(/(ing|edly|ed|ies|es|s|ment|ation|tion|ly)$/i, '')
+    .replace(/i$/i, 'y')
+}
+
+function keywords(text: string): string[] {
+  const raw = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w))
+  const stems = raw.map(stem).filter((w) => w.length >= 2)
+  return Array.from(new Set(stems))
+}
+
+function stripTags(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
 
 // Best-effort extraction of a claim/headline from a URL.
 async function extractClaimFromUrl(url: string): Promise<string> {
@@ -61,16 +79,70 @@ async function extractClaimFromUrl(url: string): Promise<string> {
       /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
     )?.[1]
     const title = html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]
-    const desc = html.match(
-      /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
-    )?.[1]
-    const headline = (ogTitle || title || '').trim()
-    const description = (desc || '').trim()
-    const combined = [headline, description].filter(Boolean).join(' — ')
-    return combined || url
+    const headline = stripTags(ogTitle || title || '').trim()
+    return headline || url
   } catch {
     return url
   }
+}
+
+// Query Google News RSS — free, no API key, aggregates hundreds of outlets.
+async function searchNews(query: string): Promise<Article[]> {
+  const url =
+    'https://news.google.com/rss/search?q=' +
+    encodeURIComponent(query) +
+    '&hl=en-US&gl=US&ceid=US:en'
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (compatible; CredibilityAnalyzer/1.0; +https://vercel.com)',
+    },
+  })
+  if (!res.ok) throw new Error(`News search failed (${res.status})`)
+  const xml = await res.text()
+
+  const items = xml.split('<item>').slice(1)
+  const articles: Article[] = []
+  for (const item of items) {
+    const block = item.split('</item>')[0]
+    const rawTitle = block.match(/<title>([\s\S]*?)<\/title>/)?.[1] ?? ''
+    const link = block.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() ?? ''
+    const pubDate =
+      block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1]?.trim() ?? ''
+    const source =
+      block.match(/<source[^>]*>([\s\S]*?)<\/source>/)?.[1]?.trim() ?? ''
+    let title = stripTags(rawTitle)
+    // Google News titles are usually "Headline - Source"; peel the source off.
+    let outlet = source
+    const dashSplit = title.lastIndexOf(' - ')
+    if (!outlet && dashSplit > 0) {
+      outlet = title.slice(dashSplit + 3).trim()
+    }
+    if (dashSplit > 0 && title.slice(dashSplit + 3).trim() === outlet) {
+      title = title.slice(0, dashSplit).trim()
+    }
+    if (!title) continue
+    articles.push({
+      title,
+      link,
+      source: outlet || 'Unknown outlet',
+      pubDate,
+    })
+  }
+  return articles
+}
+
+function coverageFor(claimKw: string[], text: string): number {
+  if (claimKw.length === 0) return 0
+  const haystack = ' ' + keywords(text).join(' ') + ' '
+  let matched = 0
+  for (const kw of claimKw) {
+    // Fuzzy: match the stem anywhere in the article's stemmed keyword set.
+    if (haystack.includes(' ' + kw + ' ') || haystack.includes(kw)) {
+      matched++
+    }
+  }
+  return matched / claimKw.length
 }
 
 export async function POST(request: Request) {
@@ -83,123 +155,134 @@ export async function POST(request: Request) {
 
   const input = (payload.input || '').trim()
   const isUrl = Boolean(payload.isUrl) || /^https?:\/\//i.test(input)
+  const now = () => new Date().toISOString()
 
   if (!input) {
     return Response.json({ error: 'No input provided.' }, { status: 400 })
   }
 
-  const timestamp = () => new Date().toISOString()
-
   try {
     const claim = isUrl ? await extractClaimFromUrl(input) : input
+    const claimKw = keywords(claim)
 
-    // Step 1: Live cross-checking across news sources with a search-grounded model.
-    const research = await generateText({
-      model: 'perplexity/sonar-pro',
-      system:
-        'You are a rigorous fact-checking researcher. Cross-check the claim ' +
-        'against MULTIPLE independent, reputable news organizations (e.g. Reuters, ' +
-        'AP, BBC, AFP, and other established outlets). For each relevant outlet, ' +
-        'state clearly what it reports and whether it supports or contradicts the ' +
-        'claim. If reporting is thin, conflicting, or absent, say so explicitly. ' +
-        'Never invent sources or coverage. Prefer primary reporting over aggregation.',
-      prompt: isUrl
-        ? `Verify the accuracy of the news at this URL by cross-checking other outlets.\n\nURL: ${input}\nExtracted headline/claim: ${claim}\n\nReport what independent outlets say about this story.`
-        : `Verify the accuracy of this claim by cross-checking independent news outlets.\n\nClaim: "${claim}"\n\nReport what independent outlets say about this claim.`,
-    })
-
-    const sources = research.sources ?? []
-    const sourceList = sources
-      .map((s) => {
-        const url = 'url' in s ? s.url : ''
-        const title = 'title' in s && s.title ? s.title : url
-        return `- ${title} (${url})`
+    if (claimKw.length < 2) {
+      return Response.json({
+        verdict: 'insufficient' as Verdict,
+        confidence: 0,
+        confidenceReason:
+          'The claim is too short or generic to extract meaningful keywords to search for.',
+        summary:
+          'We could not derive enough distinctive terms from this input to search the news reliably.',
+        uncertainty: 'Try a more specific claim or a full news headline.',
+        claim,
+        keywords: claimKw,
+        evidence: [],
+        sourceCount: 0,
+        articlesFound: 0,
+        verificationTimestamp: now(),
       })
-      .join('\n')
-
-    const uniqueSourceCount = new Set(
-      sources.map((s) => ('url' in s ? s.url : '')).filter(Boolean),
-    ).size
-
-    // Step 2: Convert the grounded research into a strict, structured verdict.
-    const { object } = await generateObject({
-      model: 'openai/gpt-4o-mini',
-      schema: analysisSchema,
-      system:
-        'You convert fact-checking research into a strict structured verdict. ' +
-        'Base every field ONLY on the provided research and sources. Do not add ' +
-        'outside knowledge. If the research shows fewer than two independent ' +
-        'corroborating outlets, do not return "verified". If the research found ' +
-        'little or no relevant coverage, return "insufficient" with low confidence. ' +
-        'Confidence must reflect the strength and agreement of the evidence.',
-      prompt:
-        `Original ${isUrl ? 'URL/headline' : 'claim'}: ${claim}\n\n` +
-        `Research findings:\n${research.text}\n\n` +
-        `Sources consulted (${uniqueSourceCount}):\n${sourceList || '(none returned)'}\n\n` +
-        'Produce the structured analysis.',
-    })
-
-    // Merge real source URLs into the evidence entries where possible.
-    const evidence = object.evidence.map((item, i) => {
-      const matched = sources.find((s) => {
-        const title = 'title' in s && s.title ? s.title : ''
-        return (
-          title &&
-          item.source &&
-          title.toLowerCase().includes(item.source.toLowerCase().split(' ')[0])
-        )
-      })
-      const url =
-        matched && 'url' in matched ? matched.url : sources[i] && 'url' in sources[i] ? (sources[i] as { url: string }).url : undefined
-      return {
-        source: item.source,
-        text: url ? `${item.text} (${url})` : item.text,
-        supports: item.supports,
-        contradicts: item.contradicts,
-        timestamp: timestamp(),
-      }
-    })
-
-    // Guardrail: never claim "verified" without enough independent sources.
-    let verdict: Verdict = object.verdict
-    let confidence = object.confidence
-    if (uniqueSourceCount < 2 && verdict === 'verified') {
-      verdict = 'mixed'
-      confidence = Math.min(confidence, 0.5)
     }
-    if (uniqueSourceCount === 0) {
+
+    const articles = await searchNews(claim)
+
+    // Score every article by how many of the claim's keywords it covers.
+    const scored = articles
+      .map((a) => ({
+        ...a,
+        coverage: coverageFor(claimKw, a.title),
+      }))
+      .sort((x, y) => y.coverage - x.coverage)
+
+    const RELEVANT = 0.5 // "most keywords present"
+    const relevant = scored.filter((a) => a.coverage >= RELEVANT)
+
+    const distinctSources = new Set(
+      relevant.map((a) => a.source.toLowerCase()),
+    )
+    const sourceCount = distinctSources.size
+    const avgCoverage =
+      relevant.length > 0
+        ? relevant.reduce((s, a) => s + a.coverage, 0) / relevant.length
+        : 0
+
+    // Build evidence: relevant matches first, else nearest related coverage.
+    const evidenceSource = relevant.length > 0 ? relevant : scored.slice(0, 4)
+    const evidence: Evidence[] = evidenceSource.slice(0, 8).map((a) => ({
+      source: a.source,
+      text: a.title,
+      url: a.link,
+      coverage: Math.round(a.coverage * 100) / 100,
+      supports: a.coverage >= RELEVANT,
+      contradicts: false,
+      timestamp: a.pubDate || now(),
+    }))
+
+    let verdict: Verdict
+    let confidence: number
+    let confidenceReason: string
+    let summary: string
+    let uncertainty: string
+
+    if (articles.length === 0) {
       verdict = 'insufficient'
       confidence = 0
+      confidenceReason = 'No news coverage was found matching these terms.'
+      summary =
+        'No independent news reporting could be found for this claim right now.'
+      uncertainty =
+        'Absence of coverage is not proof the claim is false — it may be too new, too niche, or worded differently in the press.'
+    } else if (sourceCount >= 2) {
+      verdict = 'verified'
+      const sourceScore = Math.min(sourceCount / 4, 1)
+      confidence =
+        Math.round((sourceScore * 0.5 + avgCoverage * 0.5) * 100) / 100
+      confidenceReason = `${sourceCount} independent outlets carry stories matching most of the claim's key terms (avg keyword coverage ${Math.round(
+        avgCoverage * 100,
+      )}%).`
+      summary = `Multiple independent outlets are reporting on this. ${sourceCount} distinct sources published stories that match the core keywords of the claim.`
+      uncertainty =
+        'Keyword matching confirms the topic is widely reported; it does not verify every specific detail or number in the claim.'
+    } else if (sourceCount === 1 || relevant.length > 0) {
+      verdict = 'mixed'
+      confidence = Math.round(Math.min(0.5, avgCoverage) * 100) / 100
+      confidenceReason =
+        'Only limited coverage matched the claim closely, so corroboration is weak.'
+      summary =
+        'Some related reporting exists, but not enough independent sources strongly match the claim to corroborate it confidently.'
+      uncertainty =
+        'A single outlet or partial keyword overlap is not strong corroboration. Look for additional independent confirmation.'
+    } else {
+      verdict = 'unsupported'
+      confidence = 0.2
+      confidenceReason =
+        'News exists on adjacent topics, but nothing closely matches the specifics of this claim.'
+      summary = `We found ${articles.length} related articles, but none strongly matched the claim's key terms.`
+      uncertainty =
+        'The claim may be inaccurate, worded very differently from press coverage, or simply not yet reported.'
     }
 
     return Response.json({
       verdict,
       confidence,
-      confidenceReason: object.confidenceReason,
-      summary: object.summary,
-      uncertainty: object.uncertainty,
+      confidenceReason,
+      summary,
+      uncertainty,
+      claim,
+      keywords: claimKw,
       evidence,
-      sourceCount: uniqueSourceCount,
-      verificationTimestamp: timestamp(),
+      sourceCount,
+      articlesFound: articles.length,
+      verificationTimestamp: now(),
     })
   } catch (error) {
     const message = (error as Error).message || 'Unknown error'
     console.log('[v0] analyze route error:', message)
-
-    // Surface a real service error instead of faking an "insufficient" verdict.
-    // Faking a verdict here would violate the app's core promise of no
-    // fabricated scores. The client renders this as a service banner.
-    const isBilling = /credit card|billing|quota|payment|insufficient funds/i.test(
-      message,
-    )
     return Response.json(
       {
         error: true,
-        code: isBilling ? 'ai_gateway_billing' : 'service_unavailable',
-        message: isBilling
-          ? 'Live verification is unavailable because the AI Gateway has no billing set up. Add a credit card to your Vercel AI Gateway to unlock free credits, then try again.'
-          : 'The verification service is temporarily unavailable. This is not a judgment about the claim — please try again.',
-        verificationTimestamp: timestamp(),
+        message:
+          'The news search service could not be reached. This is not a judgment about the claim — please try again.',
+        verificationTimestamp: now(),
       },
       { status: 503 },
     )
